@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"strconv"
 	"strings"
@@ -1018,16 +1019,48 @@ func (s *GatewayService) isStickyAccountUpstreamRestricted(ctx context.Context, 
 }
 
 // sseStreamErrorEventFailover 把上游 HTTP 200 + SSE 流体内的 event:error 帧转为
-// UpstreamFailoverError：尚未向客户端写出内容且错误类型为 overloaded_error 时按 529
-// 处理并触发账号侧副作用，其余按 403；同时登记 stream_error 运维记录。
+// UpstreamFailoverError，并登记 stream_error 运维记录。按 error.type 分类：
+//   - overloaded_error：尚未向客户端写出内容时按 529 处理并触发账号侧副作用；
+//     已输出时保持 403、不触发副作用（原行为）。
+//   - rate_limit_error：额度耗尽是账号状态，无论是否已输出都按 429 触发账号冷却；
+//     body 中的 error.retry_after（秒）转写为 Retry-After 头，交由 handle429 统一解析。
+//     未输出时返回 429（客户端得到 429 / 可 failover）；已输出时 HTTP 200 已固化、
+//     handler 也不会再 failover，返回值保持原 403 不变，仅额外执行冷却。
+//   - 其他类型：按 403，不触发副作用（原行为）。
 func (s *GatewayService) sseStreamErrorEventFailover(ctx context.Context, c *gin.Context, account *Account, resp *http.Response, rawData, model string, outputStarted bool) *UpstreamFailoverError {
 	body := []byte(rawData)
+	// semanticStatus 是上游错误的语义状态码，用于副作用与运维记录；
+	// returnStatus 是返回给 handler 的状态码。
 	semanticStatus := http.StatusForbidden
-	if !outputStarted && gjson.GetBytes(body, "error.type").String() == "overloaded_error" {
-		semanticStatus = 529
+	returnStatus := http.StatusForbidden
+	applySideEffects := false
+
+	switch gjson.GetBytes(body, "error.type").String() {
+	case "overloaded_error":
+		if !outputStarted {
+			semanticStatus = 529
+			returnStatus = 529
+			applySideEffects = true
+		}
+	case "rate_limit_error":
+		semanticStatus = http.StatusTooManyRequests
+		applySideEffects = true
+		if !outputStarted {
+			returnStatus = http.StatusTooManyRequests
+		}
+	}
+
+	if applySideEffects {
+		hdr := resp.Header.Clone()
+		if hdr == nil {
+			hdr = http.Header{}
+		}
+		if semanticStatus == http.StatusTooManyRequests {
+			setRetryAfterFromSSEErrorBody(hdr, body)
+		}
 		syntheticResp := &http.Response{
 			StatusCode: semanticStatus,
-			Header:     resp.Header.Clone(),
+			Header:     hdr,
 			Body:       io.NopCloser(bytes.NewReader(body)),
 		}
 		s.handleFailoverSideEffects(ctx, syntheticResp, account, model)
@@ -1066,7 +1099,25 @@ func (s *GatewayService) sseStreamErrorEventFailover(ctx context.Context, c *gin
 	)
 
 	return &UpstreamFailoverError{
-		StatusCode:   semanticStatus,
+		StatusCode:   returnStatus,
 		ResponseBody: body,
 	}
+}
+
+// setRetryAfterFromSSEErrorBody 把 SSE 错误帧 body 中的 error.retry_after（秒）
+// 转写为 Retry-After 响应头（向上取整）。上游已给出 Retry-After 头时不覆盖；
+// 缺失、非数字或非正值时不设置。
+func setRetryAfterFromSSEErrorBody(hdr http.Header, body []byte) {
+	if hdr == nil || strings.TrimSpace(hdr.Get("Retry-After")) != "" {
+		return
+	}
+	ra := gjson.GetBytes(body, "error.retry_after")
+	if !ra.Exists() || (ra.Type != gjson.Number && ra.Type != gjson.String) {
+		return
+	}
+	seconds := ra.Float()
+	if math.IsNaN(seconds) || math.IsInf(seconds, 0) || seconds <= 0 {
+		return
+	}
+	hdr.Set("Retry-After", strconv.FormatFloat(math.Ceil(seconds), 'f', 0, 64))
 }

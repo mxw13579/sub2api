@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
+	"math"
 	"net/http"
 	"regexp"
 	"strconv"
@@ -1349,6 +1350,20 @@ func (s *RateLimitService) handle429(ctx context.Context, account *Account, head
 		// 调度器让每个请求反复撞同一批持续 429 的账号（failover 预算被白白烧掉，
 		// 客户端稳定收到 429）。因此同样走可配置的秒级兜底回避，管理端可调大或关闭。
 		if account.Platform == PlatformAnthropic {
+			// 第三方 Anthropic 兼容上游（如 Meridian）不带 anthropic-ratelimit-unified-* 头，
+			// 但会给出 Retry-After（流式 SSE 错误帧的 error.retry_after 已在网关侧转写为该头）。
+			// 优先级：per-window 头 > unified-reset 头 > Retry-After > 兜底。
+			now := time.Now()
+			if resetAt, ok := anthropicRetryAfterResetTime(headers, now); ok {
+				s.notifyAccountSchedulingBlocked(account, resetAt, "429")
+				if err := s.accountRepo.SetRateLimited(ctx, account.ID, resetAt); err != nil {
+					slog.Warn("rate_limit_set_failed", "account_id", account.ID, "error", err)
+					return
+				}
+				slog.Info("anthropic_account_rate_limited", "account_id", account.ID,
+					"reset_at", resetAt, "reset_in", resetAt.Sub(now).Truncate(time.Second), "source", "retry_after")
+				return
+			}
 			slog.Warn("rate_limit_429_no_reset_time",
 				"account_id", account.ID,
 				"platform", account.Platform,
@@ -2499,6 +2514,54 @@ func openAIImageRateLimitResetAt(headers http.Header, body []byte) time.Time {
 		return now.Add(cooldown)
 	}
 	return now.Add(openAIImageRateLimitDefaultCooldown)
+}
+
+const (
+	// anthropicRetryAfterMinCooldown 是采用 Retry-After 时的最短冷却。
+	anthropicRetryAfterMinCooldown = time.Second
+	// anthropicRetryAfterMaxCooldown 与 parseAnthropicResetTimestamp 的 8 天上限保持一致。
+	anthropicRetryAfterMaxCooldown = 8 * 24 * time.Hour
+)
+
+// anthropicRetryAfterResetTime 解析 Anthropic 429 的 Retry-After 头（秒数或 HTTP-date），
+// 并通过 clampAnthropicRetryAfter 约束到 [1s, 8d]。缺失、非法、非正或已过期返回 ok=false，
+// 由调用方走兜底冷却。秒数形式在换算为 time.Duration 之前先截断到上限，避免超大值溢出。
+func anthropicRetryAfterResetTime(headers http.Header, now time.Time) (time.Time, bool) {
+	if headers == nil {
+		return time.Time{}, false
+	}
+	raw := strings.TrimSpace(headers.Get("Retry-After"))
+	if raw == "" {
+		return time.Time{}, false
+	}
+	if seconds, err := strconv.ParseFloat(raw, 64); err == nil {
+		if math.IsNaN(seconds) || math.IsInf(seconds, 0) || seconds <= 0 {
+			return time.Time{}, false
+		}
+		if seconds > anthropicRetryAfterMaxCooldown.Seconds() {
+			return now.Add(anthropicRetryAfterMaxCooldown), true
+		}
+	}
+	resetAt := parseRetryAfterResetTime(headers, now)
+	if resetAt == nil {
+		return time.Time{}, false
+	}
+	return clampAnthropicRetryAfter(*resetAt, now)
+}
+
+// clampAnthropicRetryAfter 约束 Retry-After 推导出的重置时间：
+// 零值或不晚于 now 返回 ok=false（走兜底）；不足最短冷却按最短冷却；超过 8 天按 8 天。
+func clampAnthropicRetryAfter(resetAt, now time.Time) (time.Time, bool) {
+	if resetAt.IsZero() || !resetAt.After(now) {
+		return time.Time{}, false
+	}
+	if resetAt.Sub(now) < anthropicRetryAfterMinCooldown {
+		return now.Add(anthropicRetryAfterMinCooldown), true
+	}
+	if resetAt.Sub(now) > anthropicRetryAfterMaxCooldown {
+		return now.Add(anthropicRetryAfterMaxCooldown), true
+	}
+	return resetAt, true
 }
 
 func parseRetryAfterResetTime(headers http.Header, now time.Time) *time.Time {
