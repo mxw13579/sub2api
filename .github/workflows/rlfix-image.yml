@@ -1,0 +1,83 @@
+# 补丁镜像构建（仅用于 fork 内部部署，不提交上游）。
+# 只在 push 到 build/** 分支时触发；只推送一个明确的标签，不推 latest。
+name: rlfix-image
+
+on:
+  push:
+    branches:
+      - 'build/**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rlfix-image-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE_TAG: 0.2.19-rlfix1
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check secrets
+        env:
+          DOCKERHUB_USERNAME: ${{ secrets.DOCKERHUB_USERNAME }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+        run: |
+          if [ -z "$DOCKERHUB_USERNAME" ] || [ -z "$DOCKERHUB_TOKEN" ]; then
+            echo "::error::DOCKERHUB_USERNAME / DOCKERHUB_TOKEN secrets are not set"
+            exit 1
+          fi
+          if [ "$DOCKERHUB_USERNAME" = "weishaw" ]; then
+            echo "::error::refusing to push to weishaw/*"
+            exit 1
+          fi
+
+      - name: Compute metadata
+        id: meta
+        run: |
+          echo "image=${{ secrets.DOCKERHUB_USERNAME }}/sub2api:${IMAGE_TAG}" >> "$GITHUB_OUTPUT"
+          echo "commit=$(git rev-parse --short=9 HEAD)" >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          platforms: linux/amd64
+          push: true
+          tags: ${{ steps.meta.outputs.image }}
+          build-args: |
+            COMMIT=${{ steps.meta.outputs.commit }}
+            DATE=${{ steps.meta.outputs.date }}
+            GOPROXY=https://proxy.golang.org,direct
+            GOSUMDB=sum.golang.org
+          provenance: false
+
+      - name: Summary
+        run: |
+          {
+            echo "### Image pushed"
+            echo ""
+            echo "- image: \`${{ steps.meta.outputs.image }}\`"
+            echo "- digest: \`${{ steps.build.outputs.digest }}\`"
+            echo "- commit: \`${{ steps.meta.outputs.commit }}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "digest=${{ steps.build.outputs.digest }}"
